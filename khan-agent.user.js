@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Khan Agent (Pollinations) — Assistente Autonomo
 // @namespace    https://github.com/local/khan-agent
-// @version      1.6.0
+// @version      1.8.0
 // @description  Assistente autonomo que le o Khan Academy, consulta uma IA OpenAI-compativel e responde sozinho: multipla escolha, teclado, Khan exercises e vision.
 // @match        *://*.khanacademy.org/*
 // @match        *://*.khanacademy.com/*
@@ -66,6 +66,19 @@
   /* ===========================================================================
    * CONFIGURACAO
    * ======================================================================== */
+
+  // Espelha o `// @version` do cabecalho, e o log mostra isto na partida.
+  //
+  // A pergunta que-da-resposta e "como eu sei qual versao esta rodando?" --
+  // que importa porque o favorito injeta o script pela URL e o navegador guarda
+  // em cache por ~10 minutos (medido: GitHub Pages manda max-age=600). Publicar
+  // uma correcao e ver o comportamento antigo continuar, sem explicacao, e a
+  // forma mais confusa de depurar.
+  //
+  // A duplicacao e vigiada por teste: `pack.mjs` recusa gerar o dist se este
+  // numero divergir do `@version`, o mesmo cuidado do catalogo TOOLS x ACTIONS.
+  const VERSAO = '1.8.0';
+
   const CFG = {
     // Host novo e recomendado. Sem API key o script cai para o host legado.
     endpoint: 'https://gen.pollinations.ai/v1/chat/completions',
@@ -1308,6 +1321,23 @@
       available: (s) => s.inputs.some((f) => f.kind === 'math' || f.kind === 'text'),
     },
     {
+      name: 'drag_bar',
+      kind: 'answer',
+      summary: '{"index":N,"valor":V} -> ARRASTA a barra N do grafico ate o valor V.'
+        + ' Use so quando o enunciado pedir para montar/ajustar um grafico.',
+      params: {
+        type: 'object',
+        properties: {
+          index: { type: 'integer', description: 'Indice 0-based da barra, na ordem em que aparece.' },
+          valor: { type: 'number', description: 'Altura desejada da barra, tirada da tabela do enunciado.' },
+        },
+        required: ['index', 'valor'],
+      },
+      // So aparece quando existe barra arrastavel: em questao comum esta acao
+      // seria ruido no prompt e competiria com as que resolvem o caso.
+      available: (s) => barrasDoGrafico(s.root).length > 0,
+    },
+    {
       name: 'calculate',
       kind: 'util',
       summary: '{"expression":"9/m+4","vars":{"m":3}} -> calcula a aritmetica e'
@@ -1571,6 +1601,23 @@
           + 'So use "ask_user" se a imagem vier ilegivel ou nao for o que a '
           + 'questao pede. ***'
         );
+      } else if (/FIGURA \(descricao do alt\)/.test(snap.problem || '')) {
+        // Terceiro estado, que antes nao existia: a figura nao foi anexada como
+        // imagem, MAS a descricao dela (o `alt`, transformado em texto por
+        // renderFiguresInPlace) esta no enunciado.
+        //
+        // O aviso forte de baixo seria errado aqui -- ele manda a IA pedir
+        // ajuda ao usuario numa questao que ela tem como responder. E o
+        // inverso tambem: a descricao e um RESUMO, e nao cobre pergunta que
+        // dependa da posicao das casas. Por isso o texto diz as duas coisas em
+        // vez de empurrar para um lado.
+        lines.push(
+          '*** ATENCAO: a figura desta questao NAO foi anexada como imagem, mas o '
+          + 'enunciado traz a DESCRICAO dela (linha "FIGURA"). Se a descricao '
+          + 'responder a pergunta, responda com base nela. So use "ask_user" se ela '
+          + 'for claramente insuficiente -- por exemplo, quando a pergunta depende '
+          + 'de onde cada coisa esta desenhada e a descricao so lista os valores. ***'
+        );
       } else {
         lines.push(
           '*** ATENCAO: esta questao depende de um GRAFICO ou IMAGEM que voce '
@@ -1596,6 +1643,21 @@
       if (temMath) {
         lines.push('  (campo "MATEMATICA" = use build_expression com LaTeX, nunca type_answer)');
       }
+      lines.push('');
+    }
+
+    // Grafico interativo. Sem esta secao a IA recebe a tabela e o grafico em
+    // branco, com `drag_bar` na lista de acoes e nenhuma pista de quantas barras
+    // existem -- ela teria de adivinhar o indice.
+    const barras = barrasDoGrafico(snap.root);
+    if (barras.length) {
+      const eixo = calibrarEixoGrafico(snap.root, barras);
+      lines.push(`BARRAS DO GRAFICO (${barras.length}) -- use "drag_bar" com o indice e o valor:`);
+      barras.forEach((_, i) => lines.push(`  [${i}]`));
+      lines.push(eixo
+        ? `  Escala do eixo: ${eixo.min} ate ${eixo.max}. Todos os valores acima cabem.`
+        : '  ATENCAO: nao li a escala do eixo; drag_bar vai recusar valores.');
+      lines.push('  Normalmente a resposta e a altura pedida na TABELA, na ordem das linhas.');
       lines.push('');
     }
 
@@ -2345,12 +2407,28 @@
     ).filter((el) => isSubstancial(el) && !foraDoEnunciado(el));
 
     if (imgs.length) {
-      // Alguma imagem com alt que descreve o conteudo = o agente le o alt.
-      const comAlt = imgs.filter((i) => {
-        const alt = (i.getAttribute('alt') || '').trim();
-        return alt && !/^(imagem(\s+de)?|image|photo|picture|untitled|gr[áa]fico|graph|v[íi]deo|video)\.?$/i.test(alt);
-      });
-      if (!comAlt.length) return true;
+      // Uma figura substantial dentro do enunciado e enviada MESMO com alt.
+      //
+      // A regra antiga pulava a imagem quando o alt parecia descritivo,
+      // partindo do pressuposto de que o texto do alt chegava na IA. Nao
+      // chegava: o `alt` e um atributo, e `innerText`/`textContent` nao o leem
+      // (por isso renderFiguresInPlace existe agora). A otimizacao, entao, nao
+      // poupava nada -- ela jogava fora a unica informacao que existia.
+      //
+      // Medido no quadro de 1 a 100 do pre-algebra:
+      //
+      //   enunciado enviado: "What set of numbers are shaded on the hundred chart?"
+      //   alt real         : "hundred chart with 1 and 53 shaded"   (nao ia junto)
+      //   imagem anexada   : nao (visual = false)
+      //
+      // A IA tinha a pergunta e zero pistas. Ela nao "errou a tabela": nunca
+      // recebeu nada sobre ela.
+      //
+      // Alem disso o alt e um RESUMO e a figura e o FATO. "1 and 53 shaded"
+      // basta para uma pergunta de multiplos, mas nao para "qual o proximo
+      // numero a sombrear" nem para qualquer coisa que dependa da posicao das
+      // casas. Quando ha duvida entre resumo e fato, manda o fato.
+      return true;
     }
 
     // SVG DESENHADO NO DOM. Um grafico de setores e <svg> com <path>, e nao um
@@ -2516,7 +2594,7 @@
       for (const tr of table.querySelectorAll('tr')) {
         const celulas = [...tr.querySelectorAll('th, td')]
           .map((c) => (c.textContent || '')
-            .replace(/[\u200b\u200c\u200d\u2060\ufeff]/g, '')
+            .replace(/[\u2018\u2019\u201C\u201D\u200B\uFEFF]/g, '')
             .replace(/\s+/g, ' ')
             .trim());
         // Linha so de celulas vazias nao informa nada e polui o enunciado.
@@ -2532,6 +2610,55 @@
     }
   }
 
+  // Figuras: o texto do `alt` entra no enunciado como texto.
+  //
+  // `innerText` e `textContent` nao incluem o atributo `alt` de um <img> -- ele
+  // mora no ATRIBUTO, nao no no. Entao uma figura-described-só-por-alt chega
+  // ao prompt como um espaco em branco silencioso.
+  //
+  // Medido no quadro de 1 a 100 (pre-algebra, factors-multiples):
+  //
+  //   no DOM   : <img alt="hundred chart with 1 and 53 shaded" 265x262>
+  //   no prompt: "What set of numbers are shaded on the hundred chart?"
+  //              (nenhuma mencao ao sombreamento)
+  //
+  // A IA recebia a pergunta sem nenhuma pista e so podia chutar. Este passo
+  // devolve a informacao -- e nao substitui a imagem: o alt e um RESUMO
+  // ("1 and 53 shaded"), enquanto a figura e o fato completo (o desenho, a
+  // posicao, o que mais estiver pintado). Ver tambem looksVisual, que agora
+  // anexa a imagem mesmo quando existe alt.
+  function renderFiguresInPlace(clone) {
+    for (const img of clone.querySelectorAll('img')) {
+      // Ignora as miniaturas decorativas do rodape de "conteudo relacionado":
+      // elas poluem o enunciado com "Video 2 minutos" sem dizer nada da
+      // questao. O OFF_TOPIC remove os containers, mas nao todas as imagens.
+      if (img.closest('.related-content, .site-footer, .footer')) continue;
+
+      const r = img.getBoundingClientRect();
+      const alt = (img.getAttribute('alt') || '').replace(/\s+/g, ' ').trim();
+      // Mesma régua de `looksVisual`: abaixo de 60x40 e decoracao (icone de
+      // calculadora, seta, icone do Khan), e a figura da pergunta e grande.
+      const substancial = r.width >= 60 && r.height >= 40;
+
+      // Icone decorativo: some em silencio. Sem este ramo aparecia
+      // "[FIGURA sem descricao]" no meio do enunciado por causa do icone da
+      // calculadora -- ruido que faz a IA duvidar do que e conteudo e do que
+      // e moldura.
+      if (!alt && !substancial) { img.remove(); continue; }
+
+      const bloco = document.createElement('pre');
+      if (alt) {
+        bloco.textContent = `\nFIGURA (descricao do alt): ${alt}\n`;
+      } else {
+        // Figura grande e sem alt: e melhor dizer que existe uma figura do que
+        // fingir que o enunciado esta completo.
+        const dims = `${Math.round(r.width)}x${Math.round(r.height)}`;
+        bloco.textContent = `\nFIGURA ${dims} (sem descricao disponivel)\n`;
+      }
+      img.replaceWith(bloco);
+    }
+  }
+
   function extractProblem(root) {
     const clone = root.cloneNode(true);
     // A matematica precisa virar texto legivel antes de qualquer remocao: e o
@@ -2539,6 +2666,9 @@
     renderMathInPlace(clone);
     // Idem para as tabelas: o clone ainda tem as celulas.
     renderTablesInPlace(clone);
+    // E para as figuras: o `alt` de um <img> e atributo, nao texto, entao
+    // nenhuma das remocoes acima o traria para o enunciado.
+    renderFiguresInPlace(clone);
 
     // Tira as alternativas do enunciado. O bloco de escolhas ja vai para a
     // secao ALTERNATIVAS do prompt; deixar aqui duplica o texto de forma
@@ -2564,7 +2694,7 @@
     const text = (clone.innerText || clone.textContent || '')
       // O MathJax do Khan deixa espacos de largura zero entre os simbolos
       // ("-5 <= x <= 0"); sem isso as alternativas viram "−5≤x≤0" coladas.
-      .replace(/[-‏⁠﻿]/g, '')
+      .replace(/[-\u200F\u2060\uFEFF]/g, '')
       .replace(/[ \t]+\n/g, '\n')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
@@ -2639,7 +2769,7 @@
     // ("-5 <= x <= 0"). Sem a limpeza, a alternativa chega na IA como
     // "-5<=x<=0" com lixo invisivel grudado, e comparar opcoes fica dificil.
     return (clone.innerText || clone.textContent || '')
-      .replace(/[‌‍‎‏﻿]/g, '')
+      .replace(/[\u2018\u2019\u201C\u201D\u200B\uFEFF]/g, '')
       .replace(/\s+/g, ' ')
       .trim();
   }
@@ -3567,6 +3697,135 @@
     }
   }
 
+  /* ===========================================================================
+   * GRAFICO INTERATIVO (exercicio "crie um grafico de barras")
+   * ---------------------------------------------------------------------------
+   * Nao e digitar nem marcar: o aluno precisa mexer no desenho. Medido no quiz
+   * de graficos estatisticos II do Khan:
+   *
+   *   <div data-interactive-kind-for-testing="movable-line" ...>
+   *
+   * As barras comecam com altura ZERO (uma tira de ~6 px apoiada no eixo) e o
+   * unico jeito de responder e arrastar essa tira para a altura pedida pela
+   * tabela. Sem esta acao o agente via a pergunta, oferecia so calculate /
+   * click_check / skip / ask_user / wait e nao tinha NADA a fazer com ela.
+   * ========================================================================= */
+
+  // O marcador e do proprio Khan e sobrevive aos builds -- as classes sao
+  // hashes de CSS-in-JS, mas este atributo e estavel.
+  const SEL_BARRA = '[data-interactive-kind-for-testing="movable-line"]';
+
+  function barrasDoGrafico(root) {
+    if (!root) return [];
+    return [...root.querySelectorAll(SEL_BARRA)].filter((b) => {
+      const r = b.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    });
+  }
+
+  // O Khan nao rola a JANELA: o conteudo esta num `overflow: auto` interno, e
+  // por isso `scrollIntoView` no elemento nao movia nada (`scrollY` continuava
+  // 0) e a barra seguia em y=1100 numa janela de 1000. Arrastar alvo fora da
+  // tela e arrastar no chao.
+  function rolarAte(elemento) {
+    let no = elemento?.parentElement;
+    while (no) {
+      const cs = getComputedStyle(no);
+      if (/(auto|scroll)/.test(cs.overflowY) && no.scrollHeight > no.clientHeight + 20) {
+        const r = elemento.getBoundingClientRect();
+        const alvo = r.y - no.clientHeight / 2 + r.height / 2;
+        no.scrollTop += alvo;
+        return true;
+      }
+      no = no.parentElement;
+    }
+    elemento?.scrollIntoView({ block: 'center' });
+    return false;
+  }
+
+  // Converte "a barra vale 12" em "a barra precisa ficar a esta altura".
+  //
+  // Medido: os rotulos do eixo NAO sao <text> de SVG (o svg saiu com zero
+  // <text>), sao elementos HTML com o numero como texto. Sem eles nao ha como
+  // calibrar, e o agente so poderia dar um deslocamento em pixels -- o que
+  // depende do tamanho da janela e quebraria no celular.
+  function calibrarEixoGrafico(root, barras) {
+    if (!root || !barras.length) return null;
+    // Os rotulos do eixo sao IRMAOS das barras, no mesmo container. Sem esta
+    // restricao a calibracao recolhe numeros de qualquer lugar da pagina -- e o
+    // primeiro teste pegou os VALORES DA TABELA (8, 16, 4, 12) como se fossem
+    // rotulos do eixo, produzindo uma escala furada e barras na altura errada.
+    // A tabela fica acima do grafico e nunca divide container com ele.
+    const container = barras[0].parentElement || root;
+    const xBarra = Math.min(...barras.map((b) => b.getBoundingClientRect().x));
+    const pontos = [];
+    for (const el of container.querySelectorAll('*')) {
+      if (el.children.length) continue; // so folhas: pega o rotulo, nao o pai
+      const t = (el.textContent || '').trim();
+      if (!/^-?\d+([.,]\d+)?$/.test(t)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      if (r.x > xBarra) continue; // o eixo fica a esquerda das barras
+      const v = Number(t.replace(',', '.'));
+      if (!Number.isFinite(v)) continue;
+      pontos.push({ v, y: r.y + r.height / 2 });
+    }
+    if (pontos.length < 2) return null;
+
+    // Dois pontos extremos bastam: o eixo e linear. Usa os de maior e menor
+    // valor para o alcance maximo, em vez de media, que encolhe a escala.
+    pontos.sort((a, b) => a.v - b.v);
+    const baixo = pontos[0];
+    const alto = pontos[pontos.length - 1];
+    if (alto.v === baixo.v) return null;
+    const pxPorUnidade = (baixo.y - alto.y) / (alto.v - baixo.v);
+    if (!Number.isFinite(pxPorUnidade) || pxPorUnidade <= 0) return null;
+
+    // pxPorUnidade e positivo (20 px por unidade), mas o pixel DIMINUI quando o
+    // valor sobe -- o eixo cresce para cima. Por isso a subtracao. Com o sinal
+    // errado, `yParaValor(8)` devolvia 874 num eixo cujo rotulo "8" esta em
+    // 554, e toda barra era arrastada para o lugar errado.
+    return {
+      rotulos: pontos.map((p) => p.v),
+      min: baixo.v,
+      max: alto.v,
+      yParaValor: (v) => baixo.y - (v - baixo.v) * pxPorUnidade,
+      valorParaY: (y) => baixo.v - (y - baixo.y) / pxPorUnidade,
+    };
+  }
+
+  // O arrasto em si.
+  //
+  // Medido: `MouseEvent` sintetico FUNCIONA neste widget; `PointerEvent` NAO.
+  // As duas tentativas foram feitas com a barra visivel e rolada, e o arrasto
+  // de cima foi confirmado por screenshot (a barra foi de 0 para 8, que e o
+  // valor da tabela). Como o widget escuta o evento legado do mouse e nao o
+  // de ponteiro, synthetic-new nao chega nele.
+  //
+  // Tambem medido: arrastar precisa de VARIOS `mousemove` com folga entre eles.
+  // Um salto so e ignorado.
+  async function arrastarBarra(handle, yDestino) {
+    const r = handle.getBoundingClientRect();
+    const x = Math.round(r.x + r.width / 2);
+    const y0 = Math.round(r.y + r.height / 2);
+    const y1 = Math.round(yDestino);
+
+    const ev = (tipo, yy, buttons) => new MouseEvent(tipo, {
+      bubbles: true, cancelable: true, composed: true, view: window,
+      clientX: x, clientY: yy, screenX: x, screenY: yy,
+      button: 0, buttons,
+    });
+
+    handle.dispatchEvent(ev('mousedown', y0, 1));
+    for (let i = 1; i <= 12; i++) {
+      const passo = Math.round(y0 + ((y1 - y0) * i) / 12);
+      handle.dispatchEvent(ev('mousemove', passo, 1));
+      await sleep(25);
+    }
+    handle.dispatchEvent(ev('mouseup', y1, 0));
+    await sleep(120);
+  }
+
   const ACTIONS = {
     async select_choice(params) {
       const snap = state.snapshot;
@@ -3836,6 +4095,87 @@
       const r = calcular(expr, params?.vars);
       if (r.erro) return { ok: false, reason: `calculo invalido: ${r.erro}` };
       return { ok: true, detail: `${expr} = ${r.texto}`, valor: r.valor };
+    },
+
+    // Mexer em grafico interativo: o unico jeito de responder a este tipo de
+    // exercicio.
+    //
+    // O script garante a MECANICA (arrasta) e a CALIBRACAO (converte o valor da
+    // tabela em pixel pela escala real do eixo). A IA so diz qual barra vai a
+    // qual valor -- a mesma divisao de sempre: ela decide a logica, o script
+    // executa sem depender de coordenada, que muda com o tamanho da janela.
+    async drag_bar(params) {
+      const raiz = state.snapshot?.root;
+      const barras = barrasDoGrafico(raiz);
+      if (!barras.length) return { ok: false, reason: 'esta questao nao tem barra arrastavel' };
+
+      const idx = Number(params?.index);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= barras.length) {
+        return { ok: false, reason: `index fora da faixa (0-${barras.length - 1})` };
+      }
+      const valor = Number(params?.valor);
+      if (!Number.isFinite(valor)) return { ok: false, reason: 'params.valor nao e numero' };
+
+      // Fora da tela o arrasto nao tem efeito: `elementFromPoint` devolve null e
+      // o widget nao recebe coordenada util. Rola antes de medir o eixo, senao a
+      // calibracao usa pixels de uma posicao que nao existe mais.
+      rolarAte(barras[idx]);
+      await sleep(200);
+
+      const eixo = calibrarEixoGrafico(raiz, barras);
+      if (!eixo) {
+        return {
+          ok: false,
+          reason: 'nao consegui ler a escala do eixo (sem rotulos numericos).'
+            + ' Nao da para converter valor em pixel com seguranca.',
+        };
+      }
+
+      // Fora da escala e melhor recusar do que arrastar para o chao: o widget
+      // trava no piso e o valor errado fica silenciosamente errado.
+      if (valor < eixo.min || valor > eixo.max) {
+        return {
+          ok: false,
+          reason: `valor ${valor} fora da escala do eixo (${eixo.min}..${eixo.max})`,
+        };
+      }
+
+      const handle = barras[idx];
+      const antes = handle.getBoundingClientRect();
+      // A alca e a PONTA da barra: o topo dela e o valor. Alvo = centro da
+      // alca na altura do valor pedido.
+      const meio = antes.height / 2;
+      await arrastarBarra(handle, eixo.yParaValor(valor) + meio);
+
+      // Confere o resultado de verdade, relendo a barra depois do arrasto. O
+      // `ok` do arrasto e o evento ter sido aceito; o valor reached e o que
+      // importa, e so se descobre medindo.
+      const depois = handle.getBoundingClientRect();
+      const obtido = Math.round(eixo.valorParaY(depois.y + depois.height / 2 - meio));
+      const delta = Math.abs(obtido - valor);
+      const moveu = Math.round(antes.y) !== Math.round(depois.y)
+        || Math.round(antes.height) !== Math.round(depois.height);
+
+      if (!moveu) {
+        return { ok: false, reason: `a barra ${idx} nao se moveu ao arrasto` };
+      }
+      // O eixo e desenhado com passos fixos (4, 5, 10...). Pedir 7 e legitimo,
+      // mas o grafico so encaixa na casa mais proxima -- 8. Aceitamos esse
+      // arredondamento, que e o comportamento correto, e avisamos quando a
+      // leitura ficou longe do pedido.
+      const ordenados = [...eixo.rotulos].sort((a, b) => a - b);
+      const passo = ordenados.length > 1
+        ? ordenados.slice(1).reduce((m, v, i) => Math.min(m, v - ordenados[i]), Infinity)
+        : 1;
+      const ajusta = passo > 0 ? delta <= passo : delta < 0.5;
+
+      return {
+        ok: true,
+        detail: `barra ${idx} -> ${valor} (o grafico ficou em ${obtido}`
+          + `${ajusta ? '' : ', LEITURA DIVERGE'})`,
+        valor,
+        valorObtido: obtido,
+      };
     },
 
     // "Pular" existe no Khan em dois contextos com o MESMO data-testid: pular
@@ -4367,7 +4707,11 @@
   }
 
   // Executa o plano e atualiza contadores.
-  const ANSWER_ACTIONS = new Set(['select_choice', 'type_answer', 'build_expression']);
+  // `drag_bar` entra aqui pelo mesmo motivo das outras tres: sao acoes que
+  // RESPONDEM a pergunta, e e por isso que o `autoCheck` espera por elas antes
+  // de conferir. Sem estar aqui, o script conferiria a pergunta com as barras
+  // ainda em zero e marcaria errado o que nao foi erro do modelo.
+const ANSWER_ACTIONS = new Set(['select_choice', 'type_answer', 'build_expression', 'drag_bar']);
 
   // O campo de TEXTO vivo no indice dado.
   //
@@ -5964,14 +6308,20 @@
       buildMessages, partesDeImagem, capturarFiguraDe, capturarAlternativasSemTexto,
       svgToJpeg, escalaDeRender, VISION_MAX_PX, VISION_MIN_PX,
       digitarPorEventos, apagarPorEventos, mesmaExpressao, readMathField,
+      barrasDoGrafico, calibrarEixoGrafico, arrastarBarra, rolarAte, SEL_BARRA,
       criarEventoUI, humanClick,
       ACTIONS,
+      VERSAO,
       state,
     };
     // Atalho chamado pelo bookmarklet quando o agente ja esta na pagina: mostra
     // o painel sem precisar reinjetar o arquivo.
     window.__khanAgentMostrar = () => showPanel(true);
-    log('Painel pronto. Clique em Iniciar para o agente assumir.', 'ok');
+    // A versao na PRIMEIRA linha do log, e nao em um rodape: e a primeira
+    // pergunta de quem esta confuso por um comportamento ("usei ontem e
+    // funcionava"). Quem abre o painel tem a resposta antes de ler qualquer
+    // outra linha.
+    log(`Khan Agent ${VERSAO} — painel pronto. Clique em Iniciar para o agente assumir.`, 'ok');
     // O GM_xmlhttpRequest e o que permite falar com provider sem CORS. Dizer
     // na hora se ele existe evita a confusao classica: o agente funciona, a
     // imagem e capturada, e so na chamada da IA que aparece "Failed to fetch"
