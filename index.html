@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Khan Agent — instalar</title>
+<style>
+  * { box-sizing: border-box; }
+  body { max-width: 720px; margin: 0 auto; padding: 22px 16px 70px;
+         font: 16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: #0e1219; color: #dde3ef; -webkit-text-size-adjust: 100%; }
+  h1 { font-size: 25px; margin: 0 0 2px; }
+  h2 { font-size: 16px; margin: 34px 0 10px; color: #9fb0c8;
+       text-transform: uppercase; letter-spacing: .07em; }
+  a { color: #6ee7a8; }
+  code { background: #171d28; border: 1px solid #29313f; border-radius: 6px;
+         padding: 1px 6px; font-size: 13px;
+         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  p { margin: 10px 0; }
+  ol, ul { padding-left: 22px; } li { margin: 9px 0; }
+  small, .fraco { color: #8b95a9; }
+
+  /* O campo copiavel. Fonte MONO e tamanho maior de proposito: e um codigo que
+     precisa ser conferido caractere a caractere antes de colar em um campo de
+     texto onde um erro silencioso vira "o favorito nao faz nada". */
+  #codigo { width: 100%; padding: 13px; font: 13px/1.5 ui-monospace, Menlo, monospace;
+            background: #121822; color: #9ff0c4;
+            border: 2px solid #2c3648; border-radius: 10px; word-break: break-all; }
+  #codigo:focus { outline: 2px solid #22c55e; }
+
+  button, .btn { -webkit-appearance: none; appearance: none; display: inline-block;
+                 padding: 13px 20px; margin: 10px 8px 0 0; border-radius: 10px;
+                 border: 1px solid #35415a; background: #222b3a; color: #dde3ef;
+                 font: 600 15px/1 inherit; cursor: pointer; text-decoration: none; }
+  button:active, .btn:active { transform: translateY(1px); }
+  #copiar { background: #22c55e; color: #062012; border-color: #22c55e; }
+
+  a.alvo { display: inline-block; padding: 14px 26px; margin: 6px 0 2px;
+           background: #22c55e; color: #062012; font-weight: 700;
+           border-radius: 10px; text-decoration: none; cursor: grab; }
+
+  .nota { background: #1a2029; border-left: 3px solid #f59e0b;
+          padding: 11px 14px; border-radius: 0 8px 8px 0; margin: 14px 0; font-size: 15px; }
+  .ok-nota { border-left-color: #22c55e; }
+  hr { border: 0; border-top: 1px solid #232b38; margin: 34px 0 0; }
+</style>
+</head>
+<body>
+
+<h1>Khan Agent</h1>
+<p class="fraco">Assistente autônomo para o Khan Academy. Roda no navegador, sem instalar nada.</p>
+
+<h2>No celular (Firefox Android)</h2>
+<ol>
+  <li>Toque em <strong>Copiar</strong> abaixo.</li>
+  <li>Menu <code>⋮</code> &rarr; <strong>Marcadores</strong> &rarr; <strong>+</strong> (ou Adicionar).</li>
+  <li>Nome: <code>Khan Agent</code> &nbsp;·&nbsp; Endereço: <strong>cole com toque longo &rarr; Colar</strong>.</li>
+  <li>Salve.</li>
+  <li>Abra um exercício e toque no marcador &mdash; na lista de Marcadores ou digitando <code>khan</code> na barra de endereço e tocando na sugestão.</li>
+</ol>
+<p class="fraco">O painel aparece no canto da tela. Toque no marcador de novo e ele volta, sem baixar nada.</p>
+
+<h2>Favorito</h2>
+<p><button id="copiar">Copiar</button></p>
+<input id="codigo" readonly spellcheck="false" autocomplete="off">
+
+<h2>No computador</h2>
+<p>Arraste o botão para a barra de favoritos:</p>
+<p><a class="alvo" id="bk" href="#">Khan Agent</a></p>
+<p class="fraco" id="origem"></p>
+
+<h2>Baixar o script</h2>
+<p>Para instalar no Tampermonkey, baixe o arquivo e cole o conteúdo num script novo:
+   <a href="khan-agent.user.js" download>khan-agent.user.js</a> (<span id="tam"></span>).</p>
+
+<div class="nota">
+  <strong>No Tampermonkey funciona mais coisa.</strong> Sem ele não existe
+  <code>GM_xmlhttpRequest</code>, e aí só funcionam providers que liberam CORS:
+  <strong>Groq, OpenAI, OpenRouter, Cohere, Gemini e Mistral</strong>.
+  Pollinations e NVIDIA NIM não liberam. O script avisa isso no log na hora.
+</div>
+
+<div class="nota ok-nota">
+  <strong>Ele só age no Khan Academy.</strong> O favorito carrega um script e roda na
+  página em que você está. Fora do Khan ele não faz nada — e é assim que ele
+  funciona, lendo o enunciado e clicando na resposta.
+</div>
+
+<h2>Providers sem chave</h2>
+<p>O botão <strong>Puter</strong> na tela de configuração entra sem nenhuma chave de
+   API, se o navegador aceitar. Útil para testar antes de cadastrar em algum serviço.</p>
+
+<hr>
+<p class="fraco">Versão <span id="versao"></span> · o favorito aponta para <code id="urlmostrada"></code></p>
+
+<script>
+  // O favorito aponta para o script na MESMA PASTA desta pagina. Por isso nao
+  // ha URL embutida no HTML: subir os dois arquivos num host novo ja basta.
+  // No GitHub Pages, em https://SEU-USUARIO.github.io/REPO/, ele resolve sozinho
+  // para https://SEU-USUARIO.github.io/REPO/khan-agent.user.js
+  const dir = location.origin + location.pathname.replace(/[^/]*$/, '');
+  const urlBase = dir + 'khan-agent.user.js';
+  const bk = "javascript:(function(){if(window.__khanAgent&&window.__khanAgentMostrar){window.__khanAgentMostrar();return}var s=document.createElement('script');s.src='" + urlBase + "';s.charset='utf-8';document.head.appendChild(s)})()";
+
+  const el = document.getElementById('codigo');
+  el.value = bk;
+  document.getElementById('bk').href = bk;
+  document.getElementById('urlmostrada').textContent = urlBase;
+  document.getElementById('origem').textContent = urlBase;
+  document.getElementById('tam').textContent = Math.round(272366 / 1024) + ' KB';
+
+  // Um toque no campo ja seleciona tudo. No celular e o caminho mais curto:
+  // tocar, colar. Um botao "selecionar" seria um passo a mais.
+  el.addEventListener('focus', () => el.select());
+  el.addEventListener('click', () => el.select());
+
+  document.getElementById('copiar').addEventListener('click', async (ev) => {
+    const botao = ev.currentTarget;
+    let ok = false;
+    // A Clipboard API e o caminho certo, mas o Firefox pode negar a permissao
+    // fora de um gesto do usuario ou em contexto nao seguro. O fallback com
+    // execCommand funciona onde a API falha -- e no celular ele e o mais
+    // confiavel, porque deixa o texto selecionado para um colar manual.
+    try {
+      await navigator.clipboard.writeText(bk);
+      ok = true;
+    } catch {
+      el.focus();
+      el.select();
+      try { ok = document.execCommand('copy'); } catch { ok = false; }
+    }
+    botao.textContent = ok ? 'Copiado' : 'Selecione e copie';
+    if (!ok) {
+      // Deixou selecionado de proposito: o usuario so precisa colar.
+      botao.textContent = 'Pronto — cole abaixo';
+    }
+    setTimeout(() => { botao.textContent = 'Copiar'; }, 2200);
+  });
+
+  // Versao lida do proprio script publicado, para a pagina nunca mentir sobre
+  // o que esta no ar.
+  fetch(urlBase, { cache: 'no-store' })
+    .then((r) => r.ok ? r.text() : null)
+    .then((t) => {
+      const m = t && t.match(/@version\s+([0-9.]+)/);
+      if (m) document.getElementById('versao').textContent = m[1];
+    })
+    .catch(() => { document.getElementById('versao').textContent = '?'; });
+</script>
+</body>
+</html>

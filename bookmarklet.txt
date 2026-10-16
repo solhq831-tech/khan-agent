@@ -1,0 +1,12 @@
+Este arquivo NAO tem um favorito pronto: falta a URL onde o script vai estar
+publicado. Duas formas de resolver, e as duas continuam funcionando depois:
+
+1. Copie o favorito de dentro da pagina (o certo).
+   Abra index.html no navegador. O campo "FAVORITO" ja vem preenchido com a
+   URL certa, montada a partir do endereco da propria pagina. Copie de la.
+
+2. Ou gere este arquivo com a URL ja embutida:
+   node dev/pack.mjs --url https://SEU-HOST/khan-agent.user.js
+
+Onde publicar: GitHub Pages funciona; raw.githubusercontent.com NAO funciona
+(responde text/plain + nosniff e o navegador bloqueia o <script src>).
