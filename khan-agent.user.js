@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Khan Agent (Pollinations) — Assistente Autonomo
 // @namespace    https://github.com/local/khan-agent
-// @version      1.8.0
+// @version      1.8.1
 // @description  Assistente autonomo que le o Khan Academy, consulta uma IA OpenAI-compativel e responde sozinho: multipla escolha, teclado, Khan exercises e vision.
 // @match        *://*.khanacademy.org/*
 // @match        *://*.khanacademy.com/*
@@ -77,7 +77,7 @@
   //
   // A duplicacao e vigiada por teste: `pack.mjs` recusa gerar o dist se este
   // numero divergir do `@version`, o mesmo cuidado do catalogo TOOLS x ACTIONS.
-  const VERSAO = '1.8.0';
+  const VERSAO = '1.8.1';
 
   const CFG = {
     // Host novo e recomendado. Sem API key o script cai para o host legado.
@@ -4611,14 +4611,22 @@
       // calling (ver toolSchemas). Ele e a EXPLICACAO, nao um parametro da
       // acao -- por isso sai dos params antes de executar, para nao virar lixo
       // no lugar de um campo de verdade.
-      const params = { ...(p.params || p.action_params || {}) };
+      //
+      // `normalizarPasso` adota os campos SOLTOS do passo quando nao ha
+      // embrulho `params`. Sem isso, um plano escrito a mao -- que e o formato
+      // de reserva, quando o provider nao aceita tool calling -- chega como
+      // {"action":"type_answer","inputs":[...]} e `inputs` era descartado aqui:
+      // a acao recebia params vazios e respondia "params.inputs vazio" com a
+      // resposta certa na mao. Foi assim que "nao preenche o campo" apareceu.
+      const passoNorm = normalizarPasso(p);
+      const params = { ...(passoNorm.params || {}), ...(p.action_params || {}) };
       const dito = params.thought;
       delete params.thought;
       if (action === 'select_choice') conferirChoiceText(params, snap);
       acoes.push({
         action,
         params,
-        thought: String(dito || p.thought || plan.thought || narracao || '').trim(),
+        thought: String(dito || passoNorm.thought || p.thought || plan.thought || narracao || '').trim(),
       });
     }
     if (!acoes.length) return null;
@@ -4854,8 +4862,35 @@ const ANSWER_ACTIONS = new Set(['select_choice', 'type_answer', 'build_expressio
   // re-observacao entre passos e local (takeSnapshot), nao gasta cota, e e o
   // que permite abortar quando um passo deixa de se aplicar: se a resposta
   // errou, nao existe "Continuar", e o plano para ali sozinho.
+  // Um passo SEMPRE tem `params`.
+  //
+  // O resumo de cada ferramenta no prompt mostra o OBJETO de parametros
+  // ("{\"inputs\":[...]}"), sem o embrulho `params`. Quando o modelo responde
+  // em JSON de texto -- que e o modo de reserva, e o unico caminho de quem nao
+  // tem tool calling -- ele escreve o passo como o resumo mostra:
+  //
+  //   {"actions":[{"action":"type_answer","inputs":[{"index":0,"text":"12"}]}]}
+  //
+  // e nao com `params`. Sem normalizar, `perform` chama a acao com
+  // `plan.params` = undefined e TODO preenchimento falha com
+  // "params.inputs vazio": a IA manda a resposta certa, o script recusa, e de
+  // fora parece que ele "nao consegue preencher o campo".
+  //
+  // `params` explicito sempre ganha -- o formato canonico continua funcionando
+  // igual. So os campos soltos sao adotados quando nao ha embrulho.
+  function normalizarPasso(passo) {
+    if (!passo || typeof passo !== 'object') return passo;
+    const { action, thought, params, ...resto } = passo;
+    const temParams = params && typeof params === 'object' && !Array.isArray(params);
+    return {
+      action,
+      params: temParams ? params : resto,
+      thought: thought || '',
+    };
+  }
+
   async function performPlano(plano) {
-    const passos = plano.acoes || [];
+    const passos = (plano.acoes || []).map(normalizarPasso);
     // Cronometro do plano. Ver logTempoPlano para o que esta medicao responde.
     const t0 = Date.now();
     let msExec = 0;
